@@ -12,6 +12,10 @@
 #include <lzo/lzo1x.h>
 #include "ndsfile.h"
 
+#include "gameyob_bin.h"
+#include "nesds_bin.h"
+#include "demomenu_bin.h"
+
 static bool station_open = false;
 static FILE *station_f = NULL;
 static uint8_t *station_fntbuf = NULL;
@@ -173,12 +177,12 @@ static void ndsfile_lzocmp(uint8_t **iobuf, uint32_t *iolen)
 	//try compressing to get send times down
 	printf("Compressing\n");
 	uint8_t *wrkbuf = malloc(LZO1X_999_MEM_COMPRESS);
-	lzo1x_999_compress(inbuf, inlen, cmpbuf, &cmplen, wrkbuf);
+	lzo1x_999_compress(inbuf, inlen, cmpbuf, (lzo_uint*)(&cmplen), wrkbuf);
 	free(wrkbuf);
 	if(cmplen && cmplen+0x10 < inlen)
 	{
 		//optimize for decompression speed on ds itself
-		lzo1x_optimize(cmpbuf, cmplen, inbuf, &inlen, NULL);
+		lzo1x_optimize(cmpbuf, cmplen, inbuf, (lzo_uint*)(&inlen), NULL);
 		//identification header for client
 		memcpy(tmpbuf, lzoHdr, 8);
 		//surprisingly enough big endian
@@ -193,9 +197,6 @@ static void ndsfile_lzocmp(uint8_t **iobuf, uint32_t *iolen)
 	else //keep uncompressed
 		free(tmpbuf);
 }
-
-extern uint8_t demomenu_bin[];
-extern uint32_t demomenu_bin_size;
 
 static uint8_t *menubuf = NULL;
 uint8_t *ndsfile_demomenu_start(uint32_t *len)

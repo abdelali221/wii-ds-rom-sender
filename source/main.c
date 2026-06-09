@@ -7,7 +7,6 @@
 #include <gccore.h>
 #include <stdio.h>
 #include <wiiuse/wpad.h>
-#include <wiidrc/wiidrc.h>
 #include <ogc/lwp_watchdog.h>
 #include <inttypes.h>
 #include <malloc.h>
@@ -16,13 +15,12 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <fat.h>
+#include "wd.h"
 #include "ndsfile.h"
 
-extern uint8_t gameyob_bin[];
-extern uint32_t gameyob_bin_size;
-
-extern uint8_t nesds_bin[];
-extern uint32_t nesds_bin_size;
+#include "gameyob_bin.h"
+#include "nesds_bin.h"
+#include "demomenu_bin.h"
 
 enum {
 	/* Download Play */
@@ -78,18 +76,13 @@ static lwp_t mpdl_inf_thread_ptr;
 static lwp_t mpdl_recv_thread_ptr;
 static lwp_t mpdl_send_thread_ptr;
 
-static uint8_t beaconBuf[0x20] __attribute__((aligned(32)));
 static uint8_t wdGameInfo[0x500] __attribute__((aligned(32)));
 static uint8_t *demomenubuf = NULL, *demodatabuf = NULL;
 static uint32_t demomenulen, demodatalen, demomenupkg, demodatapkg;
-static s32 __wd_fd, __wd_hid;
+static s32 __wd_fd;
 
 static void* mpdl_thread(void * nul)
 {
-	ioctlv cfg[2];
-
-	cfg[0].data = beaconBuf;
-	cfg[0].len = 2;
 
 	int cInf = 0;
 
@@ -97,9 +90,7 @@ static void* mpdl_thread(void * nul)
 	{
 		if(beaconActive)
 		{
-			memset(beaconBuf,0,0x20);
 			uint16_t beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
-			memcpy(beaconBuf, &beaconIn, 2);
 
 			uint8_t *dat = wdGameInfo+(cInf<<7);
 
@@ -113,11 +104,8 @@ static void* mpdl_thread(void * nul)
 			else
 				dat[0x16] = 0;
 
-			cfg[1].data = dat;
-			cfg[1].len = 0x80;
-
-			s32 ret = IOS_Ioctlv(__wd_fd, 0x1006, 2, 0, cfg);
-			if(ret != 0) printf("WD_SendBeacon Err %li\n", ret);
+			s32 ret = WD_ChangeBeacon(beaconIn, dat, 0x80);
+			if(ret != 0) printf("WD_SendBeacon Err 0x%x\n", ret);
 
 			cInf++;
 			if(cInf >= 10)
@@ -132,19 +120,11 @@ static uint8_t wdReq[0x94] __attribute__((aligned(32)));
 static uint8_t chan1Con[6] __attribute__((aligned(32)));
 static void* mpdl_inf_thread(void * nul)
 {
-	ioctlv req;
-	req.data = wdReq;
-	req.len = 0x94;
-
-	ioctlv wddc;
-	wddc.data = wdReq+8;
-	wddc.len = 6;
-
 	while(mpdl_active)
 	{
-		s32 ret = IOS_Ioctlv(__wd_fd, 0x8001, 0, 1, &req);
+		s32 ret = WD_RecvNotification(wdReq, 0x94);
 		if(ret != 0)
-			printf("WD_RecvNotification Err %li\n", ret);
+			printf("\rWD_RecvNotification Err 0x%x", ret);
 		else
 		{
 			int32_t ret = 0;
@@ -153,7 +133,7 @@ static void* mpdl_inf_thread(void * nul)
 			memcpy(&chan, wdReq+0xE, 2);
 			if(ret == 0 && chan)
 			{
-				//printf("DS On Channel %i connected\n", chan);
+				//printf("DS On Channel %d connected\n", chan);
 				if(chan == 1)
 				{
 					connected |= (1<<chan);
@@ -165,14 +145,14 @@ static void* mpdl_inf_thread(void * nul)
 				}
 				else
 				{
-					//printf("Channel %i not supported, forcing disconnect\n", chan);
-					ret = IOS_Ioctlv(__wd_fd, 0x1007, 1, 0, &wddc);
-					if(ret != 0) printf("WD_DisAssoc Err %li\n", ret);
+					//printf("Channel %d not supported, forcing disconnect\n", chan);
+					ret = WD_DisAssoc(wdReq+8, 6);
+					if(ret != 0) printf("WD_DisAssoc Err 0x%x\n", ret);
 				}
 			}
 			else if(ret == 1 && chan)
 			{
-				//printf("DS On Channel %i disconnected\n", chan);
+				//printf("DS On Channel %d disconnected\n", chan);
 				if(chan == 1)
 				{
 					connected &= ~(1<<chan);
@@ -183,14 +163,13 @@ static void* mpdl_inf_thread(void * nul)
 			else if(ret == 5 && chan)
 				sendError = true;
 			else if(ret != 3)
-				printf("DS Ret %li Chan %i\n", ret, chan);
+				printf("DS Ret %d Chan %d\n", ret, chan);
 		}
 	}
 	return nul;
 }
 
 static uint8_t wdRecvFrame[0x2000] __attribute__((aligned(32)));
-static ioctlv recv __attribute__((aligned(32)));
 static char stationname[10] = { 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20 };
 
 static void* mpdl_recv_thread(void * nul)
@@ -198,9 +177,7 @@ static void* mpdl_recv_thread(void * nul)
 	memset((void*)wd_c1_name, 0, 11);
 	while(mpdl_active)
 	{
-		recv.data = wdRecvFrame;
-		recv.len = 0x2000;
-		s32 ret = IOS_Ioctlv(__wd_fd, 0x8000, 0, 1, &recv);
+		s32 ret = WD_ReceiveFrame(wdRecvFrame, 0x2000);
 		if(ret > 0xA && wdRecvFrame[0xB] > 0 && wdRecvFrame[0x12] == 4)
 		{
 			uint8_t port = (wdRecvFrame[0x13]&0xF);
@@ -264,13 +241,13 @@ static void* mpdl_recv_thread(void * nul)
 						wd_datapos = __builtin_bswap16(tmp);
 						if(wd_datapos > 0) //0 is hdr, 1-end is rom
 						{
-							//printf("Requested ROM segment %i\n", wd_datapos-1);
+							//printf("Requested ROM segment %d\n", wd_datapos-1);
 							wd_databufpos=(0x1EA*(wd_datapos-1)); //ROM segment is always 0x1EA bytes
 						}
 					}
 					else if(reply == 10)
 					{
-						//printf("Done sending Data, sent %i segments\n", wd_datapos);
+						//printf("Done sending Data, sent %d segments\n", wd_datapos);
 						wd_state = WD_STATE_POSTSEND;
 					}
 				}
@@ -375,13 +352,14 @@ static const uint8_t msg_end[2] = {
 	0x02, 0x00 
 };
 
-static void wdDoSend(const uint8_t *send_buf, const u32 in_len)
+static void wdDoSend(uint8_t *send_buf, u32 in_len)
 {
+
 	uint16_t cTime = (uint16_t)(ticks_to_microsecs(gettick())/64);
-	s32 ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x1010, "h:", cTime);
-	if(ret < 0)	printf("WD_ChangeVTSF=%lx\n", ret);
-	ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x1008, "dd:", send_buf, in_len, send_buf+0x200, 0x10);
-	if(ret) printf("SendFrame Err %lx\n", ret);
+	s32 ret = WD_ChangeVTSF(cTime);
+	if(ret < 0)	printf("WD_ChangeVTSF=0x%x\n", ret);
+	ret = WD_MpSendFrame(send_buf, in_len, send_buf+0x200, 0x10);
+	if(ret) printf("SendFrame Err 0x%x\n", ret);
 }
 
 static uint8_t srlHdr[0x160];
@@ -390,23 +368,26 @@ static uint8_t *arm_databuf;
 static uint32_t arm_datalen_total;
 static uint16_t arm_datapkg_total;
 
-static const uint16_t sleepArr[5][3] = 
+static const uint16_t sleepArr[8][3] = 
 {
 	{ 6000, 2500, 2400 },
 	{ 7500, 3125, 3000 },
 	{ 9000, 3750, 3600 },
 	{10500, 4375, 4200 },
 	{12000, 5000, 4800 },
+	{ 4000, 1975, 1800 },
+	{ 3000, 1250, 1200 },
+	{ 1500, 625,  600  }
 };
-static const char sleepDispArr[5][6] = 
+static const char sleepDispArr[8][6] = 
 {
-	"1x", "1.25x", "1.5x", "1.75x", "2x",
+	"1x", "1.25x", "1.5x", "1.75x", "2x", "0.75x", "0.5x", "0.25x"
 };
 
 static uint8_t sleepVal = 0;
 
 int sendVal = 0;
-static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
+static bool sendTimes(uint8_t *send_buf, u32 in_len, uint8_t times)
 {
 	if(sendVal < times)
 	{
@@ -436,7 +417,7 @@ static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
 static uint8_t packnum = 0;
 static void* mpdl_send_thread(void * nul)
 {
-	uint8_t *wdSendBuf = iosAlloc(__wd_hid, 0x210);
+	uint8_t *wdSendBuf = calloc(1, 0x210);
 	//some raw WD config
 	memset(wdSendBuf+0x200,0,0x10);
 	wdSendBuf[0x207] = 0xC; //A and C works, C used by official games
@@ -681,13 +662,10 @@ static void* mpdl_send_thread(void * nul)
 	memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
 	wdDoSend(wdSendBuf, 4);
 
-	iosFree(__wd_hid, wdSendBuf);
+	free(wdSendBuf);
 
 	return nul;
 }
-
-static uint8_t ncdIData[0x20] __attribute__((aligned(32)));
-static uint8_t ncdOData[0x20] __attribute__((aligned(32)));
 
 #define IOCTL_ExecSuspendScheduler	1
 
@@ -697,7 +675,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v3.3 by FIX94\n");
+	printf("Wii DS ROM Sender v3.4 by FIX94 & Abdelali221\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -727,7 +705,7 @@ static void printstatus()
 				printf("Sent RSA, waiting\n");
 				break;
 			case WD_STATE_SENDDATA:
-				printf("Sending Data to DS \"%.10s\" (%i/%i Packets)\n", wd_c1_name, wd_datapos, arm_datapkg_total);
+				printf("Sending Data to DS \"%.10s\" (%d/%d Packets)\n", wd_c1_name, wd_datapos, arm_datapkg_total);
 				break;
 			case WD_STATE_POSTSEND:
 				printf("Done Sending Data to DS!\n");
@@ -748,7 +726,7 @@ static void printstatus()
 				printf("[Download Station] Preparing to send Menu\n");
 				break;
 			case WD_STATE_STATIONMENUDATA:
-				printf("[Download Station] Sending Menu (%i/%li Packets)\n", wd_datapos, demomenupkg);
+				printf("[Download Station] Sending Menu (%d/%d Packets)\n", wd_datapos, demomenupkg);
 				break;
 			case WD_STATE_STATIONMENUIDLE:
 				printf("[Download Station] Menu Sent!\n");
@@ -769,7 +747,7 @@ static void printstatus()
 				printf("[Download Station] Preparing to send Game\n");
 				break;
 			case WD_STATE_STATIONSENDDATA:
-				printf("[Download Station] Sending Game (%i/%li Packets)\n", wd_datapos, demodatapkg);
+				printf("[Download Station] Sending Game (%d/%d Packets)\n", wd_datapos, demodatapkg);
 				break;
 			case WD_STATE_STATIONPOST:
 				printf("[Download Station] Game Sent!\n");
@@ -791,6 +769,18 @@ static bool dsVerifyHdr()
 	uint16_t crc = ndsfile_crc(srlHdr, 0x15E);
 	uint16_t inCrc = srlHdr[0x15E]|(srlHdr[0x15F]<<8);
 	return (crc == inCrc);
+}
+
+uint16_t UTF8toUTF16(char chr) 
+{
+	return chr << 8;
+}
+
+void u8strtou16(char* src, uint16_t* dest, int n)
+{
+	for(int i = 0; i < n; i++) {
+		dest[i] = src[i] << 8;
+	}
 }
 
 int main() 
@@ -824,7 +814,6 @@ int main()
 	printf("PAD Init\n");
 	PAD_Init();
 	WPAD_Init();
-	WiiDRC_Init();
 	printf("FAT Init\n");
 	fatInitDefault();
 	printf("Parsing srl directory\n");
@@ -880,7 +869,7 @@ int main()
 	s32 kd_fd = IOS_Open("/dev/net/kd/request", 0);
 	if(kd_fd < 0)
 	{
-		printf("KD Open Err %li\n", kd_fd);
+		printf("KD Open Err %d\n", kd_fd);
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
@@ -890,43 +879,27 @@ int main()
 	IOS_Ioctl(kd_fd, IOCTL_ExecSuspendScheduler, NULL, 0, &out, 4);
 	IOS_Close(kd_fd);
 
-	printf("Locking Wireless Driver\n");
+	printf("Locking Wireless Driver...");
 
-	//NCDLockWirelessDriver
-	ioctlv ncdl;
-	s32 ncd_fd = IOS_Open("/dev/net/ncd/manage", 0);
-	if(ncd_fd < 0)
+	s32 lockid = NCD_LockWirelessDriver();
+	if(lockid < 0)
 	{
-		printf("NCD Open Err %li\n", ncd_fd);
+		printf("NCDLockWirelessDriver failed: lockid=0x%x\n", lockid);
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
 		free(names);
 		return 0;
 	}
-	memset(ncdOData, 0, 0x20);
-	ncdl.data = ncdOData;
-	ncdl.len = 0x20;
-	s32 ret = IOS_Ioctlv(ncd_fd, 1, 0, 1, &ncdl);
-	IOS_Close(ncd_fd);
+	printf("Done.\n");
+	int ret = 0;
 
-	s32 rights = 0;
-	memcpy(&rights, ncdOData, 4);
-	if(ret < 0)
-	{
-		printf("NCDLockWirelessDriver=%lx, rights=%lx\n", ret, rights);
-		VIDEO_WaitVSync();
-		VIDEO_WaitVSync();
-		sleep(5);
-		free(names);
-		return 0;
-	}
-
+	
 	//make sure LZO is ready when we need it
 	demomenubuf = ndsfile_demomenu_start(&demomenulen);
 
 	//allocate big buffers at once
-	__wd_hid = iosCreateHeap(0x8000);
+	//__wd_hid = iosCreateHeap(0x8000);
 	arm_databuf = malloc(0x400000);
 	uint8_t *srlBuf = malloc(0x400000);
 	//for HaxxStation
@@ -943,6 +916,38 @@ int main()
 			PAD_ScanPads();
 			WPAD_ScanPads();
 
+			u32 btns = PAD_ButtonsDown(0);
+			u32 wbtns = WPAD_ButtonsDown(0);
+			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_A))
+			{
+				printf("\nPreparing broadcast...");
+				selected = true;
+				break;
+			}
+			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_B))
+			{
+				sleepVal++;
+				if(sleepVal >= 8)
+					sleepVal = 0;
+			}
+			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_RIGHT))
+			{
+				i++;
+				if(i >= srlCnt) i = 0;
+			}
+			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_LEFT))
+			{
+				i--;
+				if(i < 0) i = (srlCnt-1);
+			}
+			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_HOME))
+				break;
+
 			printmain();
 			printf("Select ROM file or press HOME/START to exit\n");
 			printf("<< %s >>\n",names[i].name);
@@ -950,52 +955,16 @@ int main()
 			printf("Delay Timing: %s\n", sleepDispArr[sleepVal]);
 
 			VIDEO_WaitVSync();
-			VIDEO_WaitVSync();
-
-			u32 btns = PAD_ButtonsDown(0);
-			u32 wbtns = WPAD_ButtonsDown(0);
-			u32 drcbtns = 0;
-			if(WiiDRC_Inited() && WiiDRC_Connected())
-			{
-				WiiDRC_ScanPads();
-				drcbtns = WiiDRC_ButtonsDown();
-			}
-			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A) || 
-				(wbtns & WPAD_CLASSIC_BUTTON_A)  || (drcbtns & WIIDRC_BUTTON_A))
-			{
-				selected = true;
-				break;
-			}
-			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B) || 
-				(wbtns & WPAD_CLASSIC_BUTTON_B) || (drcbtns & WIIDRC_BUTTON_B))
-			{
-				sleepVal++;
-				if(sleepVal >= 5)
-					sleepVal = 0;
-			}
-			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT) || 
-				(wbtns & WPAD_CLASSIC_BUTTON_RIGHT) || (drcbtns & WIIDRC_BUTTON_RIGHT))
-			{
-				i++;
-				if(i >= srlCnt) i = 0;
-			}
-			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT) || 
-				(wbtns & WPAD_CLASSIC_BUTTON_LEFT) || (drcbtns & WIIDRC_BUTTON_LEFT))
-			{
-				i--;
-				if(i < 0) i = (srlCnt-1);
-			}
-			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME) || 
-				(wbtns & WPAD_CLASSIC_BUTTON_HOME) || (drcbtns & WIIDRC_BUTTON_HOME))
-				break;
 		}
 		if(!selected)
 			break;
 
-		char romF[256];
+		char romF[262];
 		sprintf(romF,"/srl/%s",names[i].name);
+		printf("\nOpening ROM...");
 		FILE *f = fopen(romF,"rb");
 		if(f == NULL) continue;
+		printf("Done.\n");
 		fseek(f,0,SEEK_END);
 		size_t srlSize = ftell(f);
 		rewind(f);
@@ -1134,72 +1103,59 @@ int main()
 		//Set start state
 		wd_state = WD_STATE_DSWAIT;
 
+		printf("\nStarting WD...");
 		//WD_Startup
-		__wd_fd = IOS_Open("/dev/net/wd/command", 0x10001);
-		if(__wd_fd < 0 || __wd_hid < 0)	printf("WD_Startup=HID: %li, IOS_Open: %li\n", __wd_hid, __wd_fd);
+		__wd_fd = WD_Init(DSCommunications);
+		if(__wd_fd < 0)	printf("WD_Init: 0x%x\n", __wd_fd);
+		printf("Done.");
 
-		//WD Tmp Buf Alloc
-		uint8_t *wd_tmpBuf = iosAlloc(__wd_hid, 0x1A0);
+		WD_Config conf __attribute__((aligned(32))) = {0};
 
-		//WD_GetInfo
-		memset(wd_tmpBuf, 0, 0x90);
-		ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x100E, ":d", wd_tmpBuf, 0x90);
-		if(ret < 0)	printf("WD_GetInfo=%lx\n", ret);
+		conf.mpParent.connectionTimeout = 4; //Timeout 4s?
+		conf.mpParent.beaconPeriod = 0xC8; //beacon period 200ms
+		conf.mpParent.maxNodes = 0xF; //max 15 nodes
 
-		//WD_SetConfig
-		memset(wd_tmpBuf, 0, 0x1A0);
-
-		wd_tmpBuf[0xAD] = 4; //Timeout 4s?
-		wd_tmpBuf[0xAF] = 0xC8; //beacon period 200ms
-		wd_tmpBuf[0xB0] = 0xF; //max 15 nodes
-
-		uint32_t maskA = 0x3007F; //default cfg mask
-		uint32_t maskB = 0; //default cfg mask
-		memcpy(wd_tmpBuf+0x180, &maskA, 4); 
-		memcpy(wd_tmpBuf+0x184, &maskB, 4);
-
-		ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x1004, "dd:", wd_tmpBuf, 0x180, wd_tmpBuf+0x180, 8);
-		if(ret < 0)	printf("WD_SetConfig=%lx\n", ret);
+		uint64_t mask __attribute__((aligned(32))) = 0x0003007F00000000; //default cfg mask
+		printf("\nSetting Config...");
+		ret = WD_SetConfig(&conf, mask);
+		if(ret < 0)	printf("WD_SetConfig=0x%x\n", ret);
+		printf("Done.");
 
 		//WD_StartBeacon
 		uint16_t beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
 
 		memset(wdGameInfo, 0, 0x500);
 
+		WD_GameInfo *ginfo = (WD_GameInfo*)wdGameInfo;
+
 		//Set Start Beacon Data, no clue what all these values mean
-		wdGameInfo[0] = 1; wdGameInfo[2] = 1; wdGameInfo[3] = 8;
+		ginfo->base.header = 0x01000108;
 		//DS Download Station GGID
-		wdGameInfo[4] = 0x20; wdGameInfo[5] = 1; wdGameInfo[6] = 0x40;
+		ginfo->base.GGID = 0x20014000;
 		//TGID, random every host
 		uint16_t rval = gettick();
-		wdGameInfo[8] = (rval>>8); wdGameInfo[9] = (rval&0xFF);
+		ginfo->base.TGID = (rval>>8) | (rval&0xFF);
 		//more unkown values, appear to be similar to first set
+
 		wdGameInfo[0xC] = 0xF0; wdGameInfo[0xD] = 1; wdGameInfo[0xE] = 8;
-
-		ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x1006, "hd:", beaconIn, wdGameInfo, 0x80);
-		if(ret < 0)	printf("WD_StartBeacon=%lx\n", ret);
-
+		printf("\nStarting beacon");
+		ret = WD_ChangeBeacon(beaconIn, wdGameInfo, 0x80);
+		if(ret < 0)	printf("WD_StartBeacon=0x%x\n", ret);
 		//Beacon size
-		wdGameInfo[0xA] = 0x70;
+		ginfo->base.BeaconSize = 0x70;
 		//Beacon type
-		wdGameInfo[0xB] = 3;
+		ginfo->base.BeaconType = 3;
 		//DS Download Station GGID (again)
-		wdGameInfo[0x10] = 0x20; wdGameInfo[0x11] = 1; wdGameInfo[0x12] = 0x40;
+		ginfo->base.GGID_copy = 0x20014000;
 
-		//WD_SetLinkState
-		uint32_t enable = 1;
-
-		ret = IOS_IoctlvFormat(__wd_hid, __wd_fd, 0x1002, "i:", enable);
-		if(ret < 0)	printf("WD_SetLinkState=%lx\n", ret);
+		ret = WD_SetLinkState(1);
+		if(ret < 0)	printf("WD_SetLinkState=0x%x\n", ret);
 
 		//WD_GetLinkState
 		do {
-			ret = IOS_Ioctlv(__wd_fd, 0x1003, 0, 0, NULL);
+			ret = WD_GetLinkState();
 		} while(ret == 0);
-		if(ret != 1) printf("WD_GetLinkState=%lx\n", ret);
-
-		//WD Tmp Buf Free
-		iosFree(__wd_hid, wd_tmpBuf);
+		if(ret != 1) printf("WD_GetLinkState=0x%x\n", ret);
 
 		//Set up rest of Beacon Data
 		memcpy(&tmp, srlHdr+0x68, 4);
@@ -1216,77 +1172,66 @@ int main()
 			pBin = srlBuf+iOff+0x220;
 			cBin = srlBuf+iOff+0x20;
 		}
-		//Set up Beacon PAL and CHAR Data from ROM
-		memcpy(wdGameInfo+0x1E, pBin, 0x20);
-		memcpy(wdGameInfo+0x3E, cBin, 0x42);
-		memcpy(wdGameInfo+0x9E, cBin+0x42, 0x62);
-		memcpy(wdGameInfo+0x11E, cBin+0xA4, 0x62);
-		memcpy(wdGameInfo+0x19E, cBin+0x106, 0x62);
-		memcpy(wdGameInfo+0x21E, cBin+0x168, 0x62);
-		memcpy(wdGameInfo+0x29E, cBin+0x1CA, 0x36);
+		//Set up Beacon PALETTE and CHAR Data from ROM
+		memcpy(ginfo->palette_data, pBin, 0x20);
+		memcpy(ginfo->character_data, cBin, 0x42);
+		memcpy(ginfo->character_data_1, cBin+0x42, 0x62);
+		memcpy(ginfo->character_data_2, cBin+0xA4, 0x62);
+		memcpy(ginfo->character_data_3, cBin+0x106, 0x62);
+		memcpy(ginfo->character_data_4, cBin+0x168, 0x62);
+		memcpy(ginfo->character_data_5, cBin+0x1CA, 0x36);
 		//Sender DS Name: FIX94
-		wdGameInfo[0x2D5] = 0x5;
-		wdGameInfo[0x2D6] = 0x46;
-		wdGameInfo[0x2D8] = 0x49;
-		wdGameInfo[0x2DA] = 0x58;
-		wdGameInfo[0x2DC] = 0x39;
-		wdGameInfo[0x2DE] = 0x34;
+		ginfo->sendername_len = 0x5;
+		u8strtou16("Ab221", ginfo->sendername, 5);
 		//Max Players Allowed
-		wdGameInfo[0x2EA] = 1;
-		//Game Name: NDS File
-		wdGameInfo[0x2EC] = 0x4E;
-		wdGameInfo[0x2EE] = 0x44;
-		wdGameInfo[0x2F0] = 0x53;
-		wdGameInfo[0x2F2] = 0x20;
-		wdGameInfo[0x2F4] = 0x46;
-		wdGameInfo[0x2F6] = 0x69;
-		wdGameInfo[0x2F8] = 0x6C;
-		wdGameInfo[0x2FA] = 0x65;
+		ginfo->maxplayersallowed = 1 << 8;
+		u8strtou16("DSCom Test", ginfo->gamename, 0xA);
+
 		//Description: Hi.
+		//u8strtou16("Wsp", ginfo->gamedesc, 0xA);
 		wdGameInfo[0x36A] = 0x48;
 		wdGameInfo[0x36C] = 0x69;
 		wdGameInfo[0x36E] = 0x2E;
 
 		//Set up all sequence infos
-		uint8_t base[0x1E];
-		memcpy(base,wdGameInfo,0x1E);
-		memset(wdGameInfo,0,0x1E);
+		WD_GameInfBase base;
+		memcpy(&base, wdGameInfo, sizeof(WD_GameInfBase));
+		memset(wdGameInfo, 0, sizeof(WD_GameInfBase));
 
 		for(i = 0; i < 10; i++)
 		{
-			uint8_t *cInfPtr = wdGameInfo+(i<<7);
-			memcpy(cInfPtr, base, 0x1E);
+			WD_GameInfBase *cInfPtr = (WD_GameInfBase*)(wdGameInfo+(i<<7));
+			memcpy(cInfPtr, &base, 0x1E);
 			if(i == 9) //sequence end
-				cInfPtr[0x14] = 2;
+				cInfPtr->sequence_end = 2;
 			//current sequence
-			cInfPtr[0x17] = i;
+			cInfPtr->current_sequence = i;
 			if(i < 9)
 			{
 				//current sequence
-				cInfPtr[0x1A] = i;
+				cInfPtr->unk2 = i;
 				//total sequences
-				cInfPtr[0x1B] = 9;
+				cInfPtr->total_sequences = 9;
 			}
 			else //number of players connected
-				cInfPtr[0x1A] = 0;
+				cInfPtr->unk2 = 0;
 			//set payload len
 			if(i < 8)
-				cInfPtr[0x1C] = 0x62;
+				cInfPtr->payload_len = 0x62;
 			else if(i == 8)
-				cInfPtr[0x1C] = 0x48;
+				cInfPtr->payload_len = 0x48;
 			else
-				cInfPtr[0x1C] = 1;
+				cInfPtr->payload_len = 1;
 			int j;
 			//gen checksum
 			uint32_t chk = 0;
 			for(j = 0x1A; j < 0x80; j+=2)
 			{
-				uint16_t cV = *(uint16_t*)(cInfPtr+j);
+				uint16_t cV = *(uint16_t*)(((uint8_t*)cInfPtr)+j);
 				chk+=cV;
 			}
 			chk=0xFFFF&(~(chk+(chk/0x10000)));
-			cInfPtr[0x18]=chk>>8;
-			cInfPtr[0x19]=chk&0xFF;
+			cInfPtr->checksum = chk;
 		}
 
 		//MPDLStartup Threads
@@ -1310,12 +1255,6 @@ int main()
 			if (PAD_ButtonsDown(0) || PAD_ButtonsHeld(0) || 
 				WPAD_ButtonsDown(0) || WPAD_ButtonsHeld(0))
 				break;
-			if(WiiDRC_Inited() && WiiDRC_Connected())
-			{
-				WiiDRC_ScanPads();
-				if(WiiDRC_ButtonsDown() || WiiDRC_ButtonsHeld())
-					break;
-			}
 			printmain();
 			printstatus();
 
@@ -1337,7 +1276,7 @@ int main()
 		LWP_JoinThread(mpdl_thread_ptr, NULL);
 
 		//WD_Cleanup
-		IOS_Close(__wd_fd);
+		WD_Deinit();
 
 		if(wd_haxxstation)
 		{
@@ -1356,18 +1295,7 @@ int main()
 	//No need for LZO anymore
 	ndsfile_demomenu_end();
 
-	//NCDUnlockWirelessDriver
-	ncd_fd = IOS_Open("/dev/net/ncd/manage", 0);
-	ioctlv ncdu[2];
-	memcpy(ncdIData, &rights, 4);
-	memset(ncdOData, 0, 0x20);
-	ncdu[0].data = ncdIData;
-	ncdu[0].len = 4;
-	ncdu[1].data = ncdOData;
-	ncdu[1].len = 0x20;
-	ret = IOS_Ioctlv(ncd_fd, 2, 1, 1, ncdu);
-	IOS_Close(ncd_fd);
-	if(ret < 0)	printf("NCDUnlockWirelessDriver=%lx\n", ret);
+	NCD_UnlockWirelessDriver(lockid);
 
 	printf("All done, Exit\n");
 
